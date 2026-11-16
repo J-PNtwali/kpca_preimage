@@ -175,19 +175,34 @@ class KernelPCA(SklearnKernelPCA):
 # Implements the random Fourier features approximation of the RBF kernel, which allows for a more scalable kernel PCA implementation.
 
 class RFF_KernelPCA():
-    """Random Fourier Features Kernel PCA implementation for RBF kernel."""
-    def __init__(self, n_rffs, n_components=None, gamma=1.0, append_x=False, beta=1.0,  random_state=None):
-        '''Initialize the RFFKPCA object.
+    """
+    Random Fourier Features Kernel PCA implementation for RBF kernel.
+
+    Pre-image methods:
+    =================
+    -- inverse_transform_bws: RFF version of the standard KPCA BWS method
+
+    -- inverse_transform_ours: extension of our method to KPCA-RFF
+
+    -- inverse_transform_tr: linear regression method of
+        Tiddeman, Bernard, and Will Robinson. "Pre-image calculation for random Fourier feature kernel machines."
+          UK Workshop on Computational Intelligence. Cham: Springer Nature Switzerland, 2023. 
+
+    """
+    def __init__(self, n_rffs, n_components=None, gamma=1.0, gamma_inv=None, random_state=None):
+        '''
+        Initialize the RFFKPCA object.
         
         Parameters:
         -----------
         - n_rffs (int): Number of random Fourier features.
+
         - n_components (int or None): Number of components to keep. If None, all components are kept.
+        
         - gamma (float): Kernel coefficient for RBF kernel.
                     Note: we follow sklearn's implementation where gamma is the inverse of 
                         the standard deviation of the RBF kernel, i.e., gamma = 1/(2*sigma^2).
-        - append_x (bool, default: False): Whether or not to append the state vector into the RFF feature map
-        - beta (float, default: 1.0): positive float. Scaling factor for the state vector. Ignored when `append_x = False`
+        
         - random_state (int or None): Random seed for reproducibility.
         '''
         if n_components == None:
@@ -195,27 +210,22 @@ class RFF_KernelPCA():
         self.n_rffs = n_rffs
         self.n_components = n_components
         self.gamma = gamma
-        self.append_x = append_x
-        self.beta = beta
+        self.gamma_inv = gamma if gamma_inv is None else gamma_inv
         self.random_state = random_state
 
         
     def fit(self, X):
-        n_samples, dim = X.shape
+        dim = X.shape[1]
         rng = np.random.RandomState(self.random_state)
 
         # Sample random frequencies for RFF
         self.W = rng.normal(scale=np.sqrt(2 * self.gamma), size=(dim, self.n_rffs))
         self.b = rng.uniform(0, 2 * np.pi, size=self.n_rffs)
+        self.rff_map = lambda x: np.sqrt(2) * np.cos(x @ self.W + self.b)
 
         # Compute the RFF features
-        Z = np.sqrt(2) * np.cos(X @ self.W + self.b)
-        if self.append_x:
-            Z = np.column_stack((self.beta * X, Z))
-            
-            if self.n_components > (self.n_rffs + X.shape[-1]):
-                self.n_components = -1
-
+        Z = self.rff_map(X) 
+        
         # Center the RFF features
         Z_mean = Z.mean(axis=0)
         Z_centered = Z - Z_mean
@@ -232,47 +242,191 @@ class RFF_KernelPCA():
         # Store data for later use in inverse transform
         self.X_fit_ = X.copy()
         self.Z_fit_ = Z.copy()
-
-        return self
         
     def transform(self, X):
         Z = np.sqrt(2) * np.cos(X @ self.W + self.b)
-        if self.append_x:
-            Z = np.column_stack((self.beta * X, Z))
         
         non_zeros = np.flatnonzero(self.eigenvalues_)
 
         return (Z - self.Z_fit_.mean(axis=0)) @ self.eigenvectors_[:,non_zeros]
 
-    def fit_inverse_transform(self, alpha):
+    def fit_inverse_transform_bws(self, alpha):
         if self.X_fit_ is None:
             raise ValueError("Must fit the model before calling fit_inverse_transform.")
-        
-        self.alpha = alpha
-        n_samples = self.X_fit_.shape[0]
-        # diagonal elements accounting for potential zero eigenvalues
-        non_zeros = np.flatnonzero(self.eigenvalues_)
-        diag = 1 / (n_samples * (self.eigenvalues_[non_zeros] + self.alpha))
 
-        self.weights = ((self.Z_fit_ - self.Z_fit_.mean(axis=0)) @ (self.eigenvectors_[:, non_zeros]  * diag)).T @ (self.X_fit_ - self.X_fit_.mean(axis=0))
+        if not hasattr(self, '_preimage_eigenvals_'):
+            #===== generate RFFs ===============
+            rng = np.random.RandomState(self.random_state)
+            # Sample random frequencies for RFF
+            n = self.n_components if self.n_components != -1 else len(self.eigenvalues_)
+            self.preimage_W= rng.normal(scale=np.sqrt(2 * self.gamma_inv), size=(n, self.n_rffs))
+            self.preimage_b = rng.uniform(0, 2 * np.pi, size=self.n_rffs)
+            self.preimage_rff_map = lambda x: np.sqrt(2/self.n_rffs) * np.cos(x @ self.preimage_W + self.preimage_b) 
 
-    def inverse_transform(self, X_transformed, alpha=1e-12):
+            #=========== evaluate RFF map at training data ============
+            self.preimage_Z_fit = self.preimage_rff_map(self.transform(self.X_fit_))
+            # compute the eigenvalues and eigenvectors 
+            self._preimage_eigenvals_bws_, self._preimage_eigenvectors_bws_ = np.linalg.eigh(self.preimage_Z_fit.T @ self.preimage_Z_fit)
+            # pre-compute fixed element
+            self.fixed_M_bws = self._preimage_eigenvectors_bws_.T @ self.preimage_Z_fit.T @ self.X_fit_
+
+        self.alpha_bws = alpha
+        diag = 1 / (self._preimage_eigenvals_bws_ + self.alpha_bws)
+        self.dual_coeffs = self._preimage_eigenvectors_bws_ @ (diag[:, None] * self.fixed_M_bws)
+           
+    def inverse_transform_bws(self, X_transformed, alpha=None):
+        if not hasattr(self, 'dual_coeffs') or alpha is not None:
+            self.fit_inverse_transform_bws(alpha)
+
+        return self.preimage_rff_map(X_transformed) @ self.dual_coeffs
+
+    def inverse_transform_bws2(self, X_transformed, alpha=[1e-12]):
+        ''''
+            Efficient `inverse_transform_bws` for multiple alpha values.
+        '''
         if self.X_fit_ is None:
-            raise ValueError("Must fit the model before calling inverse_transform.")
+            raise ValueError("Must fit the model before calling this function.")
+
+        if not hasattr(self, '_preimage_eigenvals_bws_'):
+            #===== generate RFFs ===============
+            rng = np.random.RandomState(self.random_state)
+            # Sample random frequencies for RFF
+            n = self.n_components if self.n_components != -1 else len(self.eigenvalues_)
+            self.preimage_W = rng.normal(scale=np.sqrt(2 * self.gamma_inv), size=(n, self.n_rffs))
+            self.preimage_b = rng.uniform(0, 2 * np.pi, size=self.n_rffs)
+            self.preimage_rff_map = lambda x: np.sqrt(2/self.n_rffs) * np.cos(x @ self.preimage_W + self.preimage_b) 
+
+            #=========== evaluate RFF map at training data ============
+            self.preimage_Z_fit = self.preimage_rff_map(self.transform(self.X_fit_))
+            # compute the eigenvalues and eigenvectors 
+            self._preimage_eigenvals_bws_, self._preimage_eigenvectors_bws_ = np.linalg.eigh(self.preimage_Z_fit.T @ self.preimage_Z_fit)
+            # pre-compute fixed factor
+            self.fixed_M_bws = self._preimage_eigenvectors_bws_.T @ self.preimage_Z_fit.T @ self.X_fit_
+
+        # compute diagonal elements for each alpha (vectorized) 
+        diag = 1 / (self._preimage_eigenvals_bws_ + np.array(alpha).reshape(-1, 1))        
+        # compute the inverse transform for each alpha (vectorized)
+        return  (self.preimage_rff_map(X_transformed) @ self._preimage_eigenvectors_bws_) @ (diag[:, :, None] * self.fixed_M_bws)
+
+    def fit_inverse_transform_ours(self, alpha):
+            if self.X_fit_ is None:
+                raise ValueError("Must fit the model before calling fit_inverse_transform.")
+            
+            if not hasattr(self, 'fixed_M_ours'):
+                non_zeros = np.flatnonzero(self.eigenvalues_)
+                self.fixed_M_ours = (self.eigenvectors_[:, non_zeros].T @ (self.Z_fit_ - self.Z_fit_.mean(axis=0)).T) @ (self.X_fit_ - self.X_fit_.mean(axis=0))
+            
+            self.alpha = alpha
+            n_samples = self.X_fit_.shape[0]
+            # diagonal elements accounting for potential zero eigenvalues
+            non_zeros = np.flatnonzero(self.eigenvalues_)
+            diag = 1 / (n_samples * (self.eigenvalues_[non_zeros] + self.alpha))
+            self.weights = diag[:, None] * self.fixed_M_ours
+
+            #self.weights = ((self.Z_fit_ - self.Z_fit_.mean(axis=0)) @ (self.eigenvectors_[:, non_zeros] * diag)).T @ (self.X_fit_ - self.X_fit_.mean(axis=0))
+    
+    def inverse_transform_ours(self, X_transformed, alpha=None):
+        if not hasattr(self, 'weights') or alpha is not None:
+            self.fit_inverse_transform_ours(alpha)
         
         return self.X_fit_.mean(axis=0) + X_transformed @ self.weights
     
-    def inverse_transform2(self, X_transformed, alpha=[1e-12]):
+    def inverse_transform_ours2(self, X_transformed, alpha=[1e-12]):
+        '''
+        Evaluate the inverse transform with possibly multiple ridge paramater values for hyperparam tuning
+        '''
         if self.X_fit_ is None:
-            raise ValueError("Must fit the model before calling inverse_transform.")
+            raise ValueError("Must fit the model before calling this function.")
         
+        if not hasattr(self, 'fixed_M_ours'):
+            non_zeros = np.flatnonzero(self.eigenvalues_)
+            self.fixed_M_ours = (self.eigenvectors_[:, non_zeros].T @ (self.Z_fit_ - self.Z_fit_.mean(axis=0)).T) @ (self.X_fit_ - self.X_fit_.mean(axis=0))
+                    
         n_samples = self.X_fit_.shape[0]
         # diagonal elements accounting for potential zero eigenvalues
         non_zeros = np.flatnonzero(self.eigenvalues_)
         diag = 1 / (n_samples * (self.eigenvalues_[non_zeros] + np.array(alpha).reshape(-1, 1)))
 
-        U = (self.eigenvectors_[:, non_zeros].T @ (self.Z_fit_ - self.Z_fit_.mean(axis=0)).T) @ (self.X_fit_ - self.X_fit_.mean(axis=0))
+        return self.X_fit_.mean(axis=0) + (X_transformed * diag[:, None, :]) @ self.fixed_M_ours
 
-        return self.X_fit_.mean(axis=0) + (X_transformed * diag[:, None, :]) @ U
+    def fit_inverse_transform_tr(self, alpha=0.0):
+        if self.X_fit_ is None:
+            raise ValueError("Must fit the model before calling fit_inverse_transform.")
+
+        if not hasattr(self, '_preimage_eigenvals_tr_'):
+            # transformed data
+            X_transformed = self.transform(self.X_fit_)
+            # append 1 for the constant term
+            X_transformed = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
+            # compute the eigenvalues and eigenvectors 
+            self._preimage_eigenvals_tr_, self._preimage_eigenvectors_tr_ = np.linalg.eigh(X_transformed.T @ X_transformed)
+            # pre-compute fixed element
+            self.fixed_M_tr = self._preimage_eigenvectors_tr_.T @ X_transformed.T @ self.X_fit_
+
+        self.alpha_tr = alpha
+        diag = 1 / (self._preimage_eigenvals_tr_ + self.alpha_tr)
+        self.tr_weights = self._preimage_eigenvectors_tr_ @ (diag[:, None] * self.fixed_M_tr)
+
+    def inverse_transform_tr(self, X_transformed, alpha=None):
+        if not hasattr(self, 'tr_weights'):
+            self.fit_inverse_transform_tr(alpha) if alpha else self.fit_inverse_transform_tr()
+        # append 1 for the constant term
+        X_transformed = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
+
+        return X_transformed @ self.tr_weights
+
+    # def inverse_transform_tr2(self, X_transformed, alpha=[1e-12]):
+    #     ''''
+    #         Efficient `inverse_transform_tr` for multiple alpha values.
+    #     '''
+    #     if self.X_fit_ is None:
+    #         raise ValueError("Must fit the model before calling this method.")
+
+    #     if not hasattr(self, '_preimage_eigenvals_tr_'):
+    #         # transformed data
+    #         X_transformed = self.transform(self.X_fit_)
+    #         # append 1 for the constant term
+    #         X_transformed = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
+    #         # compute the eigenvalues and eigenvectors 
+    #         self._preimage_eigenvals_tr_, self._preimage_eigenvectors_tr_ = np.linalg.eigh(X_transformed.T @ X_transformed)
+    #         # pre-compute fixed element
+    #         self.fixed_M_tr = self._preimage_eigenvectors_tr_.T @ X_transformed.T @ self.X_fit_
+
+    #     # append 1 for the constant term
+    #     X_transformed = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
+
+    #     # compute diagonal elements for each alpha (vectorized) 
+    #     diag = 1 / (self._preimage_eigenvals_tr_ + np.array(alpha).reshape(-1, 1))        
+    #     # compute the inverse transform for each alpha (vectorized)
+    #     print((X_transformed @ self._preimage_eigenvectors_tr_).shape)
+    #     return  (X_transformed @ self._preimage_eigenvectors_tr_) @ (diag[:, :, None] * self.fixed_M_tr)
+
+    def inverse_transform_tr2(self, X_transformed, alpha=[1e-12]):
+        '''
+        Efficient `inverse_transform_tr` for multiple alpha values.
+        X_transformed: KPCA-RFF embedding of the points to invert, shape (m, q).
+        Returns an array of shape (n_alpha, m, d).
+        '''
+        if self.X_fit_ is None:
+            raise ValueError("Must fit the model before calling this method.")
+
+        # one-time setup, cached across calls
+        if not hasattr(self, '_preimage_eigenvals_tr_'):
+            Z_fit = self.transform(self.X_fit_)
+            Z_fit = np.column_stack([np.ones((Z_fit.shape[0], 1)), Z_fit])  # constant term
+            eigvals, eigvecs = np.linalg.eigh(Z_fit.T @ Z_fit)
+            self._preimage_eigenvals_tr_ = np.maximum(eigvals, 0.0)  
+            self._preimage_eigenvectors_tr_ = eigvecs
+            self.fixed_M_tr = eigvecs.T @ Z_fit.T @ self.X_fit_
+
+        # augment the points to invert with the constant term
+        Z = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
+
+        # diagonal ridge factors for each alpha: (n_alpha, q+1)
+        diag = 1 / (self._preimage_eigenvals_tr_ + np.array(alpha).reshape(-1, 1))
+
+        # (m, q+1) @ [(n_alpha, q+1, 1) * (q+1, d)] -> (n_alpha, m, d)
+        return (Z @ self._preimage_eigenvectors_tr_) @ (diag[:, :, None] * self.fixed_M_tr)
+    
     
 

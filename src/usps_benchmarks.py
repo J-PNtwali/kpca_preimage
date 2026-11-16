@@ -69,7 +69,7 @@ def get_usps_data(n_train=2_000, n_test=1_000, n_val=200, noise_scale=0.1, noise
     return data, targets
 
 def ridge_optimizer(kpca_obj:object, X_val:np.array, X_val_noisy:np.array=None,
-                     baseline=True, return_best=True, lower=1e-12, upper=1e+1, n_alpha=10):
+                     baseline=True, method=None, return_best=True, lower=1e-12, upper=1e+1, n_alpha=10):
     if X_val_noisy is None:
         X_val_noisy = X_val
 
@@ -82,7 +82,15 @@ def ridge_optimizer(kpca_obj:object, X_val:np.array, X_val_noisy:np.array=None,
             Xs = kpca_obj.inverse_transform_ours2(kpca_obj.transform(X_val_noisy), alpha=alphas)
     
     if isinstance(kpca_obj, RFF_KernelPCA):
-        Xs = kpca_obj.inverse_transform2(kpca_obj.transform(X_val_noisy), alpha=alphas)
+        assert method is not None, "method should not be None"
+        if method == 'ours':
+            Xs = kpca_obj.inverse_transform_ours2(kpca_obj.transform(X_val_noisy), alpha=alphas)
+        elif method == 'bws':
+            Xs = kpca_obj.inverse_transform_bws2(kpca_obj.transform(X_val_noisy), alpha=alphas)
+        elif method == 'tr':
+            Xs = kpca_obj.inverse_transform_tr2(kpca_obj.transform(X_val_noisy), alpha=alphas)
+        else:
+            raise ValueError("Invalid method. Must be either of {'ours', 'bws','tr'}.")
     
     # calculate metrics for each of the reconstructions
     mse_, ssim_, psnr_ = metrics.multi_test_metrics(X_val.reshape(-1, 16, 16), Xs.reshape(n_alpha, -1, 16, 16))
@@ -201,116 +209,6 @@ def run_benchmark(n_components:int, methods:Union[List[str], str]='all', kernel:
     out_metrics = {key: metrics.metrics(data['X_test'].reshape(-1, 16, 16), value.reshape(-1, 16, 16)) for key, value in out_data.items() if value is not None and key != 'test'}
     
     return out_data, out_metrics
-
-def run_rff_benchmark(n_components:int, Sigma:list, num_rffs:list, num_samples:list, seeds:list, n_test:int=1_000,
-                    n_val:int=200, noise_scale:float=0.25, noise_train:bool=True, rescale:bool=False, n_alpha:int=20):
-    
-    all_metrics, all_timing = [], []
-
-    for l, seed in enumerate(seeds):
-        if l > 0:
-                print("="*75)
-        print(f"seed: {seed}")
-        
-        for i, n_train in enumerate(num_samples):
-            print("-"*50)
-            print(f"n_train: {n_train}")
-            
-            # get train, val, test data
-            data, _ = get_usps_data(n_train, n_test, n_val, noise_scale, noise_train, rescale, seed)
-
-            for j, sigma in enumerate(Sigma):
-                print(" "*5 + f"sigma: {sigma}")
-                gamma = 1 / (2 * sigma**2)
-                #-----------------------------------------------------------------
-                #            Exact kernel PCA once                               #
-                #-----------------------------------------------------------------
-                kpca_timing = {}
-                #==== fitting KPCA
-                t = TimingResult()
-                with timer_and_memory(t):
-                    kpca = KernelPCA(n_components=n_components, kernel='rbf', gamma=gamma, random_state=seed)
-                    kpca.fit(data['X_train']) 
-
-                kpca_timing['fit'] = {'time_s': t.elapsed,'peak_memory_kb': t.peak_kb}
-                
-                #===== fit inverse transform (including ridge parameter tuning) 
-                alpha_l, alpha_u = 1e-12, 1e-0
-                t = TimingResult()
-                with timer_and_memory(t):
-                    alpha_ours = ridge_optimizer(kpca, data['X_val'], data['X_val_noisy'], baseline=False, lower=alpha_l, upper=alpha_u, n_alpha=n_alpha)['alpha']                
-                    kpca.fit_inverse_transform_ours(alpha=alpha_ours)
-                kpca_timing['fit_inverse'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-
-                #===== KPCA projection
-                t = TimingResult()
-                with timer_and_memory(t):
-                    X_kpca_transformed = kpca.transform(data['X_test_noisy'])
-                kpca_timing['projection'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-
-                #===== reconstruction
-                t = TimingResult()
-                with timer_and_memory(t):
-                    X_kpca_reconstructed = kpca.inverse_transform_ours(X_kpca_transformed) 
-                kpca_timing['reconstruction'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-
-                #===== calculate metrics 
-                kpca_metrics = metrics.metrics(data['X_test'].reshape(-1, 16, 16), X_kpca_reconstructed.reshape(-1, 16, 16))
-
-                #-----------------------------------------------------------------
-                #            RFF-KPCA by number of n_rffs                        #
-                #-----------------------------------------------------------------
-                for k, n_rffs in enumerate(num_rffs):
-                    end = '\n' if k == len(num_rffs)-1 else ''  
-                    empty = 10 if k == 0 else 1
-                    print(" "*empty + f"n_rffs: {n_rffs} |", end=end)
-
-                    rff_timing = {}
-                    
-                    #==== fitting KPCA-RFF
-                    t = TimingResult()
-                    with timer_and_memory(t):
-                        kpca_rff = RFF_KernelPCA(n_components=n_components, n_rffs=n_rffs, gamma=kpca.gamma, random_state=seed, append_x=False)
-                        _ = kpca_rff.fit(data['X_train'])
-
-                    rff_timing['fit'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-                        
-
-                    #===== fit inverse transform (including ridge parameter tuning) 
-                    t = TimingResult()
-                    with timer_and_memory(t):
-                        alpha_rff = ridge_optimizer(kpca_rff, data['X_val'], data['X_val_noisy'], lower=alpha_l, upper=alpha_u, n_alpha=n_alpha)['alpha']
-                        kpca_rff.fit_inverse_transform(alpha=alpha_rff)
-
-                    rff_timing['fit_inverse'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-                        
-
-                    #===== RFF projection
-                    t = TimingResult()
-                    with timer_and_memory(t):
-                        X_rff_transformed = kpca_rff.transform(data['X_test_noisy'])
-                    rff_timing['projection'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-                        
-                    #===== reconstruction
-                    t = TimingResult()
-                    with timer_and_memory(t):
-                        X_rff_reconstructed = kpca_rff.inverse_transform(X_rff_transformed) 
-                    rff_timing['reconstruction'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
-                        
-
-                    #-----------------------------------------------------------------
-                    #            Metrics                                             #
-                    #----------------------------------------------------------------- 
-                    rff_metrics = metrics.metrics(data['X_test'].reshape(-1, 16, 16), X_rff_reconstructed.reshape(-1, 16, 16))
-                    
-                    out_metrics = {'kpca': kpca_metrics, 'rff': rff_metrics, 'sigma': sigma, 'n_train':n_train, 'n_rff': n_rffs, 'seed': seed}
-                    all_metrics.append(pd.DataFrame(out_metrics))
-
-                    #===== merge timing
-                    out_timing =  {'kpca': kpca_timing, 'rff': rff_timing, 'sigma': sigma, 'n_train':n_train, 'n_rff': n_rffs, 'seed': seed}
-                    all_timing.append(out_timing)
-                
-    return all_metrics, all_timing
 
 def run_efficiency_benchmark(num_components:Union[List[int], int]=50, num_train:Union[List[int], int]=2_000, num_test:Union[List[int], int]=1_000, 
                             seed:int=42, num_repeats:int=1, sigma:Union[List[float], float]=50, n_val:int=100, noise_scale:float=0.25, 
@@ -475,4 +373,219 @@ def run_efficiency_benchmark(num_components:Union[List[int], int]=50, num_train:
     return all_metrics, all_timing
     
 
+def run_benchmark_rff(n_components:int, Sigma:list, num_rffs:list, num_samples:list, seed:int=42, n_test:int=1_000,
+                    n_val:int=200, noise_scale:float=0.25, noise_train:bool=True, rescale:bool=False, n_alpha:int=20):
+    
+    all_metrics, all_timing = [], []
 
+        
+    for i, n_train in enumerate(num_samples):
+        print("-"*50)
+        print(f"n_train: {n_train}")
+        
+        # get train, val, test data
+        data, _ = get_usps_data(n_train, n_test, n_val, noise_scale, noise_train, rescale, seed)
+
+        for j, sigma in enumerate(Sigma):
+            print(" "*5 + f"sigma: {sigma}")
+            gamma = 1 / (2 * sigma**2)
+            #-----------------------------------------------------------------
+            #            Exact kernel PCA once                               #
+            #-----------------------------------------------------------------
+            kpca_timing = {}
+            #==== fitting KPCA
+            t = TimingResult()
+            with timer_and_memory(t):
+                kpca = KernelPCA(n_components=n_components, kernel='rbf', gamma=gamma, random_state=seed)
+                kpca.fit(data['X_train']) 
+
+            kpca_timing['fit'] = {'time_s': t.elapsed,'peak_memory_kb': t.peak_kb}
+            
+            #===== fit inverse transform (including ridge parameter tuning) 
+            alpha_l, alpha_u = 1e-12, 1e-0
+            t = TimingResult()
+            with timer_and_memory(t):
+                alpha_ours = ridge_optimizer(kpca, data['X_val'], data['X_val_noisy'], baseline=False, lower=alpha_l, upper=alpha_u, n_alpha=n_alpha)['alpha']                
+                kpca.fit_inverse_transform_ours(alpha=alpha_ours)
+            kpca_timing['fit_inverse'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+
+            #===== KPCA projection
+            t = TimingResult()
+            with timer_and_memory(t):
+                X_kpca_transformed = kpca.transform(data['X_test_noisy'])
+            kpca_timing['projection'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+
+            #===== reconstruction
+            t = TimingResult()
+            with timer_and_memory(t):
+                X_kpca_reconstructed = kpca.inverse_transform_ours(X_kpca_transformed) 
+            kpca_timing['reconstruction'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+
+            #===== calculate metrics 
+            kpca_metrics = metrics.metrics(data['X_test'].reshape(-1, 16, 16), X_kpca_reconstructed.reshape(-1, 16, 16))
+
+            #-----------------------------------------------------------------
+            #            RFF-KPCA by number of n_rffs                        #
+            #-----------------------------------------------------------------
+            for k, n_rffs in enumerate(num_rffs):
+                end = '\n' if k == len(num_rffs)-1 else ''  
+                empty = 10 if k == 0 else 1
+                print(" "*empty + f"n_rffs: {n_rffs} |", end=end)
+
+                rff_timing = {}
+                
+                #==== fitting KPCA-RFF
+                t = TimingResult()
+                with timer_and_memory(t):
+                    kpca_rff = RFF_KernelPCA(n_components=n_components, n_rffs=n_rffs, gamma=kpca.gamma, random_state=seed, append_x=False)
+                    _ = kpca_rff.fit(data['X_train'])
+
+                rff_timing['fit'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                    
+
+                #===== fit inverse transform (including ridge parameter tuning) 
+                t = TimingResult()
+                with timer_and_memory(t):
+                    alpha_rff = ridge_optimizer(kpca_rff, data['X_val'], data['X_val_noisy'], lower=alpha_l, upper=alpha_u, n_alpha=n_alpha)['alpha']
+                    kpca_rff.fit_inverse_transform(alpha=alpha_rff)
+
+                rff_timing['fit_inverse'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                    
+
+                #===== RFF projection
+                t = TimingResult()
+                with timer_and_memory(t):
+                    X_rff_transformed = kpca_rff.transform(data['X_test_noisy'])
+                rff_timing['projection'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                    
+                #===== reconstruction
+                t = TimingResult()
+                with timer_and_memory(t):
+                    X_rff_reconstructed = kpca_rff.inverse_transform(X_rff_transformed) 
+                rff_timing['reconstruction'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                    
+
+                #-----------------------------------------------------------------
+                #            Metrics                                             #
+                #----------------------------------------------------------------- 
+                rff_metrics = metrics.metrics(data['X_test'].reshape(-1, 16, 16), X_rff_reconstructed.reshape(-1, 16, 16))
+                
+                out_metrics = {'kpca': kpca_metrics, 'rff': rff_metrics, 'sigma': sigma, 'n_train':n_train, 'n_rff': n_rffs, 'seed': seed}
+                all_metrics.append(pd.DataFrame(out_metrics))
+
+                #===== merge timing
+                out_timing =  {'kpca': kpca_timing, 'rff': rff_timing, 'sigma': sigma, 'n_train':n_train, 'n_rff': n_rffs, 'seed': seed}
+                all_timing.append(out_timing)
+                
+    return all_metrics, all_timing
+
+
+def run_efficiency_benchmark_rff(n_components:int, Sigma:list, num_rffs:list, num_samples:list, seeds:list, n_test:int=1_000,
+                    n_val:int=200, noise_scale:float=0.25, noise_train:bool=True, rescale:bool=False, n_alpha:int=20):
+    
+    all_metrics, all_timing = [], []
+
+    for l, seed in enumerate(seeds):
+        if l > 0:
+                print("="*75)
+        print(f"seed: {seed}")
+        
+        for i, n_train in enumerate(num_samples):
+            print("-"*50)
+            print(f"n_train: {n_train}")
+            
+            # get train, val, test data
+            data, _ = get_usps_data(n_train, n_test, n_val, noise_scale, noise_train, rescale, seed)
+
+            for j, sigma in enumerate(Sigma):
+                print(" "*5 + f"sigma: {sigma}")
+                gamma = 1 / (2 * sigma**2)
+                #-----------------------------------------------------------------
+                #            Exact kernel PCA once                               #
+                #-----------------------------------------------------------------
+                kpca_timing = {}
+                #==== fitting KPCA
+                t = TimingResult()
+                with timer_and_memory(t):
+                    kpca = KernelPCA(n_components=n_components, kernel='rbf', gamma=gamma, random_state=seed)
+                    kpca.fit(data['X_train']) 
+
+                kpca_timing['fit'] = {'time_s': t.elapsed,'peak_memory_kb': t.peak_kb}
+                
+                #===== fit inverse transform (including ridge parameter tuning) 
+                alpha_l, alpha_u = 1e-12, 1e-0
+                t = TimingResult()
+                with timer_and_memory(t):
+                    alpha_ours = ridge_optimizer(kpca, data['X_val'], data['X_val_noisy'], baseline=False, lower=alpha_l, upper=alpha_u, n_alpha=n_alpha)['alpha']                
+                    kpca.fit_inverse_transform_ours(alpha=alpha_ours)
+                kpca_timing['fit_inverse'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+
+                #===== KPCA projection
+                t = TimingResult()
+                with timer_and_memory(t):
+                    X_kpca_transformed = kpca.transform(data['X_test_noisy'])
+                kpca_timing['projection'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+
+                #===== reconstruction
+                t = TimingResult()
+                with timer_and_memory(t):
+                    X_kpca_reconstructed = kpca.inverse_transform_ours(X_kpca_transformed) 
+                kpca_timing['reconstruction'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+
+                #===== calculate metrics 
+                kpca_metrics = metrics.metrics(data['X_test'].reshape(-1, 16, 16), X_kpca_reconstructed.reshape(-1, 16, 16))
+
+                #-----------------------------------------------------------------
+                #            RFF-KPCA by number of n_rffs                        #
+                #-----------------------------------------------------------------
+                for k, n_rffs in enumerate(num_rffs):
+                    end = '\n' if k == len(num_rffs)-1 else ''  
+                    empty = 10 if k == 0 else 1
+                    print(" "*empty + f"n_rffs: {n_rffs} |", end=end)
+
+                    rff_timing = {}
+                    
+                    #==== fitting KPCA-RFF
+                    t = TimingResult()
+                    with timer_and_memory(t):
+                        kpca_rff = RFF_KernelPCA(n_components=n_components, n_rffs=n_rffs, gamma=kpca.gamma, random_state=seed, append_x=False)
+                        _ = kpca_rff.fit(data['X_train'])
+
+                    rff_timing['fit'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                        
+
+                    #===== fit inverse transform (including ridge parameter tuning) 
+                    t = TimingResult()
+                    with timer_and_memory(t):
+                        alpha_rff = ridge_optimizer(kpca_rff, data['X_val'], data['X_val_noisy'], lower=alpha_l, upper=alpha_u, n_alpha=n_alpha)['alpha']
+                        kpca_rff.fit_inverse_transform(alpha=alpha_rff)
+
+                    rff_timing['fit_inverse'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                        
+
+                    #===== RFF projection
+                    t = TimingResult()
+                    with timer_and_memory(t):
+                        X_rff_transformed = kpca_rff.transform(data['X_test_noisy'])
+                    rff_timing['projection'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                        
+                    #===== reconstruction
+                    t = TimingResult()
+                    with timer_and_memory(t):
+                        X_rff_reconstructed = kpca_rff.inverse_transform(X_rff_transformed) 
+                    rff_timing['reconstruction'] = {'time_s': t.elapsed, 'peak_memory_kb': t.peak_kb}
+                        
+
+                    #-----------------------------------------------------------------
+                    #            Metrics                                             #
+                    #----------------------------------------------------------------- 
+                    rff_metrics = metrics.metrics(data['X_test'].reshape(-1, 16, 16), X_rff_reconstructed.reshape(-1, 16, 16))
+                    
+                    out_metrics = {'kpca': kpca_metrics, 'rff': rff_metrics, 'sigma': sigma, 'n_train':n_train, 'n_rff': n_rffs, 'seed': seed}
+                    all_metrics.append(pd.DataFrame(out_metrics))
+
+                    #===== merge timing
+                    out_timing =  {'kpca': kpca_timing, 'rff': rff_timing, 'sigma': sigma, 'n_train':n_train, 'n_rff': n_rffs, 'seed': seed}
+                    all_timing.append(out_timing)
+                
+    return all_metrics, all_timing
