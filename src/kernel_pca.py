@@ -375,32 +375,6 @@ class RFF_KernelPCA():
 
         return X_transformed @ self.tr_weights
 
-    # def inverse_transform_tr2(self, X_transformed, alpha=[1e-12]):
-    #     ''''
-    #         Efficient `inverse_transform_tr` for multiple alpha values.
-    #     '''
-    #     if self.X_fit_ is None:
-    #         raise ValueError("Must fit the model before calling this method.")
-
-    #     if not hasattr(self, '_preimage_eigenvals_tr_'):
-    #         # transformed data
-    #         X_transformed = self.transform(self.X_fit_)
-    #         # append 1 for the constant term
-    #         X_transformed = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
-    #         # compute the eigenvalues and eigenvectors 
-    #         self._preimage_eigenvals_tr_, self._preimage_eigenvectors_tr_ = np.linalg.eigh(X_transformed.T @ X_transformed)
-    #         # pre-compute fixed element
-    #         self.fixed_M_tr = self._preimage_eigenvectors_tr_.T @ X_transformed.T @ self.X_fit_
-
-    #     # append 1 for the constant term
-    #     X_transformed = np.column_stack([np.ones((X_transformed.shape[0], 1)), X_transformed])
-
-    #     # compute diagonal elements for each alpha (vectorized) 
-    #     diag = 1 / (self._preimage_eigenvals_tr_ + np.array(alpha).reshape(-1, 1))        
-    #     # compute the inverse transform for each alpha (vectorized)
-    #     print((X_transformed @ self._preimage_eigenvectors_tr_).shape)
-    #     return  (X_transformed @ self._preimage_eigenvectors_tr_) @ (diag[:, :, None] * self.fixed_M_tr)
-
     def inverse_transform_tr2(self, X_transformed, alpha=[1e-12]):
         '''
         Efficient `inverse_transform_tr` for multiple alpha values.
